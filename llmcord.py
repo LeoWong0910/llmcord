@@ -12,6 +12,7 @@ import httpx
 from openai import AsyncOpenAI
 import yaml
 from discord import app_commands
+from discord.ext import commands
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,7 +84,21 @@ def get_config(filename="config.yaml"):
 cfg = get_config()
 
 if client_id := cfg["client_id"]:
-    logging.info(f"\n\nBOT INVITE URL:\nhttps://discord.com/api/oauth2/authorize?client_id={client_id}&permissions=412317273088&scope=bot\n")
+    invite_permissions = discord.Permissions(
+        # 基本权限
+        send_messages=True,          # 发送消息
+        view_channel=True,           # 查看频道（原 read_messages）
+        read_message_history=True,   # 读取消息历史
+        embed_links=True,            # 嵌入链接
+        attach_files=True,           # 附加文件
+        use_external_emojis=True,    # 使用外部表情
+        add_reactions=True,          # 添加反应
+        # 不需要 application_commands，因为它是在 scope 中设置的
+    )
+    
+    # 在 scope 中添加 applications.commands
+    invite_url = f"https://discord.com/api/oauth2/authorize?client_id={client_id}&permissions={invite_permissions.value}&scope=bot%20applications.commands"
+    logging.info(f"\n\nBOT INVITE URL:\n{invite_url}\n")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -93,11 +108,15 @@ class LLMClient(discord.Client):
     def __init__(self):
         super().__init__(intents=intents, activity=activity)
         self.tree = app_commands.CommandTree(self)
+        # 添加一个标志来追踪是否已同步命令
+        self.synced = False
 
     async def setup_hook(self):
-        # 同步全局命令
-        await self.tree.sync()
-        logging.info("Slash commands synced!")
+        # 只在第一次启动时同步命令
+        if not self.synced:
+            await self.tree.sync()
+            self.synced = True
+            logging.info("Slash commands synced!")
 
 discord_client = LLMClient()
 
@@ -441,14 +460,25 @@ async def main():
     await discord_client.start(cfg["bot_token"])
 
 
-# 修改和添加斜杠命令
-@discord_client.tree.command(name="chat", description="與AI助手對話")
-@app_commands.describe(message="輸入你想說的話")
+# 修改斜杠命令的实现
+@discord_client.tree.command(name="chat", description="与AI助手对话")
 async def chat(interaction: discord.Interaction, message: str):
-    """與AI助手對話"""
-    await interaction.response.defer()
-    response = await process_message(interaction, message)
-    await interaction.followup.send(response)
+    """与AI助手对话"""
+    try:
+        await interaction.response.defer()
+        response = await process_message(interaction, message)
+        # 确保响应不超过Discord的限制
+        if len(response) > 2000:
+            # 分块发送
+            chunks = [response[i:i+1900] for i in range(0, len(response), 1900)]
+            await interaction.followup.send(chunks[0])
+            for chunk in chunks[1:]:
+                await interaction.channel.send(chunk)
+        else:
+            await interaction.followup.send(response)
+    except Exception as e:
+        logging.exception("Error in chat command")
+        await interaction.followup.send(f"❌ 发生错误：{str(e)}", ephemeral=True)
 
 @discord_client.tree.command(name="tokens", description="查看令牌使用統計")
 async def tokens(interaction: discord.Interaction):
@@ -462,54 +492,49 @@ async def cost(interaction: discord.Interaction):
 
 @discord_client.tree.command(name="reset", description="重置統計數據（僅管理員）")
 async def reset(interaction: discord.Interaction):
-    """重置統計數據"""
-    if interaction.user.guild_permissions.administrator:
-        token_usage['total_tokens'] = 0
-        token_usage['completion_tokens'] = 0
-        token_usage['prompt_tokens'] = 0
-        token_usage['conversations'] = 0
-        token_usage['total_cost'] = 0
-        token_usage['last_reset'] = datetime.now().isoformat()
-        save_token_usage()
-        await interaction.response.send_message("✅ 統計數據已重置！")
-    else:
-        await interaction.response.send_message("❌ 只有管理員可以重置統計數據！", ephemeral=True)
+    """重置統計數據（僅管理員）"""
+    try:
+        # 检查是否为服务器所有者或管理员
+        if interaction.guild and (interaction.user.id == interaction.guild.owner_id or interaction.user.guild_permissions.administrator):
+            token_usage['total_tokens'] = 0
+            token_usage['completion_tokens'] = 0
+            token_usage['prompt_tokens'] = 0
+            token_usage['conversations'] = 0
+            token_usage['total_cost'] = 0
+            token_usage['last_reset'] = datetime.now().isoformat()
+            save_token_usage()
+            await interaction.response.send_message("✅ 統計數據已重置！", ephemeral=True)
+        else:
+            await interaction.response.send_message(
+                "❌ 只有服務器擁有者或管理員可以重置統計數據！",
+                ephemeral=True
+            )
+    except Exception as e:
+        await interaction.response.send_message(f"❌ 重置時發生錯誤：{str(e)}", ephemeral=True)
 
-@discord_client.tree.command(name="help", description="顯示所有可用命令")
-async def help(interaction: discord.Interaction):
-    """顯示幫助信息"""
-    help_text = """
+@discord_client.tree.command(name="help", description="显示帮助信息")
+async def help_command(interaction: discord.Interaction):
+    """显示帮助信息"""
+    try:
+        help_text = """
 💡 **AI助手指令列表**
 
-📝 基礎對話
-• `/chat [消息]` - 與AI助手對話
-• `@AI助手 [消息]` - 另一種對話方式
+基础命令：
+• `/chat [消息]` - 与AI助手对话
+• `/help` - 显示此帮助信息
+• `/tokens` - 查看令牌使用统计
+• `/cost` - 查看成本统计
+• `/daily` - 查看每日统计
+• `/info` - 查看机器人信息
 
-📊 統計信息
-• `/tokens` - 查看令牌使用統計
-• `/cost` - 查看成本統計
-• `/daily` - 查看每日使用統計
-
-💡 管理功能
-• `/reset` - 重置統計數據（僅管理員）
-• `/sync` - 同步斜杠命令（僅管理員）
-• `/config` - 查看當前配置（僅管理員）
-
-🔍 使用提示：
-1. 可以發送圖片（支持視覺模型）
-2. 可以發送文本文件
-3. 可以在線程中使用
-4. 支持多輪對話
-5. 支持中英文切換
-
-💰 計費說明：
-• 每1K令牌成本：
-  - 提示：$0.03
-  - 回覆：$0.06
-• 支持餘額查詢
-• 支持成本統計
+管理命令（需要管理員權限）：
+• `/sync` - 同步斜杠命令
+• `/reset` - 重置统计数据
+• `/config` - 查看当前配置
 """
-    await interaction.response.send_message(help_text)
+        await interaction.response.send_message(help_text)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ 显示帮助时发生错误：{str(e)}", ephemeral=True)
 
 @discord_client.tree.command(name="daily", description="查看每日使用統計")
 async def daily(interaction: discord.Interaction):
@@ -547,19 +572,55 @@ async def config(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("❌ 只有管理員可以查看配置！", ephemeral=True)
 
-# 添加一个命令同步的斜杠命令（僅管理員可用）
+# 修改 sync 命令
 @discord_client.tree.command(name="sync", description="同步斜杠命令（僅管理員）")
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
 async def sync(interaction: discord.Interaction):
     """同步斜杠命令（僅管理員）"""
     try:
-        await discord_client.tree.sync()
-        await interaction.response.send_message("✅ 斜杠命令已同步！", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.response.send_message("❌ 權限不足，需要管理員權限！", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        
+        # 检查是否为服务器所有者或管理员
+        if interaction.guild and (interaction.user.id == interaction.guild.owner_id or interaction.user.guild_permissions.administrator):
+            try:
+                synced = await discord_client.tree.sync()
+                await interaction.followup.send(
+                    f"✅ 成功同步 {len(synced)} 個斜杠命令！",
+                    ephemeral=True
+                )
+                logging.info(f"Synced {len(synced)} commands")
+            except discord.HTTPException as e:
+                await interaction.followup.send(
+                    f"❌ 同步命令時發生錯誤：{str(e)}",
+                    ephemeral=True
+                )
+        else:
+            await interaction.followup.send(
+                "❌ 只有服務器擁有者或管理員可以使用此命令！",
+                ephemeral=True
+            )
     except Exception as e:
-        await interaction.response.send_message(f"❌ 同步失敗：{str(e)}", ephemeral=True)
+        logging.exception("Error in sync command")
+        await interaction.followup.send(f"❌ 執行同步時發生錯誤：{str(e)}", ephemeral=True)
+
+# 添加一个全局错误处理器
+@discord_client.event
+async def on_interaction_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CommandOnCooldown):
+        await interaction.response.send_message(
+            f"⏳ 請稍等 {error.retry_after:.2f} 秒後再試！",
+            ephemeral=True
+        )
+    elif isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ 你沒有權限使用此命令！",
+            ephemeral=True
+        )
+    else:
+        logging.error(f"Interaction error: {str(error)}")
+        await interaction.response.send_message(
+            f"❌ 執行命令時發生錯誤：{str(error)}",
+            ephemeral=True
+        )
 
 # 修改處理消息的函數定義
 async def process_message(message_obj, content, images=None):
@@ -668,5 +729,70 @@ async def show_usage_stats(interaction: discord.Interaction):
 • 每千令牌成本：${(cost * 1000 / max(1, total)):.4f}
 """
     await interaction.response.send_message(usage_str)
+
+# 添加错误处理装饰器
+@discord_client.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.errors.CommandNotFound):
+        return
+    logging.error(f"Command error: {str(error)}")
+
+# 添加 info 命令
+@discord_client.tree.command(name="info", description="查看機器人信息")
+async def info(interaction: discord.Interaction):
+    """顯示機器人信息"""
+    try:
+        # 计算运行时间
+        uptime = datetime.now() - BOT_START_TIME
+        days = uptime.days
+        hours, remainder = divmod(uptime.seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        # 获取配置信息
+        cfg = get_config()
+        bot_info = cfg.get('bot_info', {})
+        
+        # 构建信息文本
+        info_text = f"""
+🤖 **AI助手信息**
+
+⏱️ **運行時間**
+• {days}天 {hours}小時 {minutes}分鐘 {seconds}秒
+
+📊 **版本信息**
+• 當前版本：{BOT_VERSION}
+• {FORK_INFO}
+
+💡 **主要功能**
+"""
+        # 添加功能列表
+        features = bot_info.get('features', [
+            "支持多種 LLM 模型",
+            "支持圖片分析",
+            "支持中英文對話",
+            "支持多輪對話",
+            "支持文本文件處理"
+        ])
+        
+        for feature in features:
+            info_text += f"• {feature}\n"
+            
+        info_text += f"""
+🔧 **技術細節**
+• 使用模型：{cfg['model']}
+• 最大文本：{cfg['max_text']:,} 字符
+• 最大圖片：{cfg['max_images']} 張
+• 最大對話：{cfg['max_messages']} 條
+"""
+        
+        await interaction.response.send_message(info_text)
+    except Exception as e:
+        logging.exception("Error in info command")
+        await interaction.response.send_message(f"❌ 獲取信息時發生錯誤：{str(e)}", ephemeral=True)
+
+# 添加启动时间记录
+BOT_START_TIME = datetime.now()
+BOT_VERSION = "v0.001"
+FORK_INFO = "Fork from jakobdylanc/llmcord"
 
 asyncio.run(main())
