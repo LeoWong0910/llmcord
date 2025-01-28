@@ -166,20 +166,65 @@ async def on_message(new_msg):
     if new_msg.author.bot:
         return
 
+    # 检查是否需要处理消息
+    is_dm = new_msg.channel.type == discord.ChannelType.private
+    if not is_dm and discord_client.user not in new_msg.mentions:
+        return
+
+    # 检查权限
+    role_ids = tuple(role.id for role in getattr(new_msg.author, "roles", ()))
+    channel_ids = tuple(id for id in (new_msg.channel.id, getattr(new_msg.channel, "parent_id", None), getattr(new_msg.channel, "category_id", None)) if id)
+
+    cfg = get_config()
+    allow_dms = cfg["allow_dms"]
+    
+    # 检查权限设置
+    if isinstance(cfg["permissions"], dict):
+        permissions = cfg["permissions"]
+        (allowed_user_ids, blocked_user_ids), (allowed_role_ids, blocked_role_ids), (allowed_channel_ids, blocked_channel_ids) = (
+            (perm["allowed_ids"], perm["blocked_ids"]) for perm in (permissions["users"], permissions["roles"], permissions["channels"])
+        )
+    else:
+        allowed_user_ids = blocked_user_ids = allowed_role_ids = blocked_role_ids = allowed_channel_ids = blocked_channel_ids = []
+
+    allow_all_users = not allowed_user_ids if is_dm else not allowed_user_ids and not allowed_role_ids
+    is_good_user = allow_all_users or new_msg.author.id in allowed_user_ids or any(id in allowed_role_ids for id in role_ids)
+
+    if not is_good_user:
+        return
+
     # 处理 @ 消息
     if discord_client.user in new_msg.mentions:
         try:
-            # 获取聊天历史
-            cfg = get_config()
-            max_messages = cfg["max_messages"]
-            history = await get_chat_history(new_msg.channel, new_msg, max_messages - 1)
+            # 获取最近的连续消息
+            messages = []
+            current_author = new_msg.author
+            async for msg in new_msg.channel.history(limit=20, before=new_msg):
+                if msg.author != current_author:
+                    break
+                if discord_client.user not in msg.mentions:
+                    continue
+                content = msg.content.replace(discord_client.user.mention, '').strip()
+                if content:
+                    messages.insert(0, content)
             
             # 添加当前消息
-            content = new_msg.content.replace(discord_client.user.mention, '').strip()
-            history.append({
+            current_content = new_msg.content.replace(discord_client.user.mention, '').strip()
+            if current_content:
+                messages.append(current_content)
+            
+            # 如果没有有效消息，直接返回
+            if not messages:
+                return
+                
+            # 合并连续消息
+            combined_message = "\n".join(messages)
+            
+            # 构建对话历史
+            history = [{
                 "role": "user",
-                "content": content
-            })
+                "content": combined_message
+            }]
             
             # 添加系统提示
             if system_prompt := cfg["system_prompt"]:
@@ -220,245 +265,8 @@ async def on_message(new_msg):
         except Exception as e:
             logging.exception("Error processing message")
             await new_msg.reply(f"❌ 发生错误：{str(e)}")
-
-    # 检查是否需要处理常规消息
-    is_dm = new_msg.channel.type == discord.ChannelType.private
-    if not is_dm and discord_client.user not in new_msg.mentions:
-        return
-
-    role_ids = tuple(role.id for role in getattr(new_msg.author, "roles", ()))
-    channel_ids = tuple(id for id in (new_msg.channel.id, getattr(new_msg.channel, "parent_id", None), getattr(new_msg.channel, "category_id", None)) if id)
-
-    cfg = get_config()
-    allow_dms = cfg["allow_dms"]
-    
-    # 檢查權限設置的格式
-    if isinstance(cfg["permissions"], dict):
-        permissions = cfg["permissions"]
-        (allowed_user_ids, blocked_user_ids), (allowed_role_ids, blocked_role_ids), (allowed_channel_ids, blocked_channel_ids) = (
-            (perm["allowed_ids"], perm["blocked_ids"]) for perm in (permissions["users"], permissions["roles"], permissions["channels"])
-        )
-    else:
-        # 如果是舊格式，使用默認權限（允許所有）
-        allowed_user_ids = blocked_user_ids = allowed_role_ids = blocked_role_ids = allowed_channel_ids = blocked_channel_ids = []
-
-    allow_all_users = not allowed_user_ids if is_dm else not allowed_user_ids and not allowed_role_ids
-    is_good_user = allow_all_users or new_msg.author.id in allowed_user_ids or any(id in allowed_role_ids for id in role_ids)
-    is_bad_user = not is_good_user or new_msg.author.id in blocked_user_ids or any(id in blocked_role_ids for id in role_ids)
-
-    allow_all_channels = not allowed_channel_ids
-    is_good_channel = allow_dms if is_dm else allow_all_channels or any(id in allowed_channel_ids for id in channel_ids)
-    is_bad_channel = not is_good_channel or any(id in blocked_channel_ids for id in channel_ids)
-
-    if is_bad_user or is_bad_channel:
-        return
-
-    provider, model = cfg["model"].split("/", 1)
-    base_url = cfg["providers"][provider]["base_url"]
-    api_key = cfg["providers"][provider].get("api_key", "sk-no-key-required")
-    openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
-
-    accept_images = any(x in model.lower() for x in VISION_MODEL_TAGS)
-    accept_usernames = any(x in provider.lower() for x in PROVIDERS_SUPPORTING_USERNAMES)
-
-    max_text = cfg["max_text"]
-    max_images = cfg["max_images"] if accept_images else 0
-    max_messages = cfg["max_messages"]
-
-    use_plain_responses = cfg["use_plain_responses"]
-    max_message_length = 2000 if use_plain_responses else (4096 - len(STREAMING_INDICATOR))
-
-    # Build message chain and set user warnings
-    messages = []
-    user_warnings = set()
-    curr_msg = new_msg
-    while curr_msg != None and len(messages) < max_messages:
-        curr_node = msg_nodes.setdefault(curr_msg.id, MsgNode())
-
-        async with curr_node.lock:
-            if curr_node.text == None:
-                cleaned_content = curr_msg.content.removeprefix(discord_client.user.mention).lstrip()
-
-                good_attachments = {type: [att for att in curr_msg.attachments if att.content_type and type in att.content_type] for type in ALLOWED_FILE_TYPES}
-
-                curr_node.text = "\n".join(
-                    ([cleaned_content] if cleaned_content else [])
-                    + [embed.description for embed in curr_msg.embeds if embed.description]
-                    + [(await httpx_client.get(att.url)).text for att in good_attachments["text"]]
-                )
-
-                curr_node.images = [
-                    dict(type="image_url", image_url=dict(url=f"data:{att.content_type};base64,{b64encode((await httpx_client.get(att.url)).content).decode('utf-8')}"))
-                    for att in good_attachments["image"]
-                ]
-
-                curr_node.role = "assistant" if curr_msg.author == discord_client.user else "user"
-
-                curr_node.user_id = curr_msg.author.id if curr_node.role == "user" else None
-
-                curr_node.has_bad_attachments = len(curr_msg.attachments) > sum(len(att_list) for att_list in good_attachments.values())
-
-                try:
-                    if (
-                        not curr_msg.reference
-                        and discord_client.user.mention not in curr_msg.content
-                        and (prev_msg_in_channel := ([m async for m in curr_msg.channel.history(before=curr_msg, limit=1)] or [None])[0])
-                        and prev_msg_in_channel.type in (discord.MessageType.default, discord.MessageType.reply)
-                        and prev_msg_in_channel.author == (discord_client.user if curr_msg.channel.type == discord.ChannelType.private else curr_msg.author)
-                    ):
-                        curr_node.next_msg = prev_msg_in_channel
-                    else:
-                        is_public_thread = curr_msg.channel.type == discord.ChannelType.public_thread
-                        next_is_parent_msg = not curr_msg.reference and is_public_thread and curr_msg.channel.parent.type == discord.ChannelType.text
-
-                        if next_msg_id := curr_msg.channel.id if next_is_parent_msg else getattr(curr_msg.reference, "message_id", None):
-                            if next_is_parent_msg:
-                                curr_node.next_msg = curr_msg.channel.starter_message or await curr_msg.channel.parent.fetch_message(next_msg_id)
-                            else:
-                                curr_node.next_msg = curr_msg.reference.cached_message or await curr_msg.channel.fetch_message(next_msg_id)
-
-                except (discord.NotFound, discord.HTTPException):
-                    logging.exception("Error fetching next message in the chain")
-                    curr_node.fetch_next_failed = True
-
-            if curr_node.images[:max_images]:
-                content = ([dict(type="text", text=curr_node.text[:max_text])] if curr_node.text[:max_text] else []) + curr_node.images[:max_images]
-            else:
-                content = curr_node.text[:max_text]
-
-            if content != "":
-                message = dict(content=content, role=curr_node.role)
-                if accept_usernames and curr_node.user_id != None:
-                    message["name"] = str(curr_node.user_id)
-
-                messages.append(message)
-
-            if len(curr_node.text) > max_text:
-                user_warnings.add(f"⚠️ Max {max_text:,} characters per message")
-            if len(curr_node.images) > max_images:
-                user_warnings.add(f"⚠️ Max {max_images} image{'' if max_images == 1 else 's'} per message" if max_images > 0 else "⚠️ Can't see images")
-            if curr_node.has_bad_attachments:
-                user_warnings.add("⚠️ Unsupported attachments")
-            if curr_node.fetch_next_failed or (curr_node.next_msg != None and len(messages) == max_messages):
-                user_warnings.add(f"⚠️ Only using last {len(messages)} message{'' if len(messages) == 1 else 's'}")
-
-            curr_msg = curr_node.next_msg
-
-    logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
-
-    if system_prompt := cfg["system_prompt"]:
-        system_prompt_extras = [f"Today's date: {dt.now().strftime('%B %d %Y')}."]
-        if accept_usernames:
-            system_prompt_extras.append("User's names are their Discord IDs and should be typed as '<@ID>'.")
-
-        full_system_prompt = "\n".join([system_prompt] + system_prompt_extras)
-        messages.append(dict(role="system", content=full_system_prompt))
-
-    # Generate and send response message(s) (can be multiple if response is long)
-    response_msgs = []
-    response_contents = []
-    prev_chunk = None
-    edit_task = None
-
-    embed = discord.Embed()
-    for warning in sorted(user_warnings):
-        embed.add_field(name=warning, value="", inline=False)
-
-    kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_body=cfg["extra_api_parameters"])
-    try:
-        async with new_msg.channel.typing():
-            retry_count = 0
-            max_retries = 3
             
-            while retry_count < max_retries:
-                try:
-                    async for curr_chunk in await openai_client.chat.completions.create(**kwargs):
-                        prev_content = prev_chunk.choices[0].delta.content if prev_chunk != None and prev_chunk.choices[0].delta.content else ""
-                        curr_content = curr_chunk.choices[0].delta.content or ""
-
-                        prev_chunk = curr_chunk
-
-                        if not (response_contents or prev_content):
-                            continue
-
-                        if start_next_msg := response_contents == [] or len(response_contents[-1] + prev_content) > max_message_length:
-                            response_contents.append("")
-
-                        response_contents[-1] += prev_content
-
-                        if not use_plain_responses:
-                            finish_reason = curr_chunk.choices[0].finish_reason
-
-                            ready_to_edit = (edit_task == None or edit_task.done()) and dt.now().timestamp() - last_task_time >= EDIT_DELAY_SECONDS
-                            msg_split_incoming = len(response_contents[-1] + curr_content) > max_message_length
-                            is_final_edit = finish_reason != None or msg_split_incoming
-                            is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
-
-                            if start_next_msg or ready_to_edit or is_final_edit:
-                                if edit_task != None:
-                                    await edit_task
-
-                                embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
-                                embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
-
-                                if start_next_msg:
-                                    reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
-                                    response_msg = await reply_to_msg.reply(embed=embed, silent=True)
-                                    response_msgs.append(response_msg)
-
-                                    msg_nodes[response_msg.id] = MsgNode(next_msg=new_msg)
-                                    await msg_nodes[response_msg.id].lock.acquire()
-                                else:
-                                    edit_task = asyncio.create_task(response_msgs[-1].edit(embed=embed))
-
-                                last_task_time = dt.now().timestamp()
-
-                        # Update token usage if available in the response
-                        if hasattr(curr_chunk, 'usage') and curr_chunk.usage:
-                            try:
-                                token_usage['total_tokens'] += getattr(curr_chunk.usage, 'total_tokens', 0)
-                                token_usage['completion_tokens'] += getattr(curr_chunk.usage, 'completion_tokens', 0)
-                                token_usage['prompt_tokens'] += getattr(curr_chunk.usage, 'prompt_tokens', 0)
-                                token_usage['conversations'] = token_usage.get('conversations', 0) + 1
-                                
-                                # 更新总成本
-                                if model in MODEL_PRICES:
-                                    new_cost = (getattr(curr_chunk.usage, 'completion_tokens', 0) / 1000 * MODEL_PRICES[model]['completion'] +
-                                               getattr(curr_chunk.usage, 'prompt_tokens', 0) / 1000 * MODEL_PRICES[model]['prompt'])
-                                    token_usage['total_cost'] = token_usage.get('total_cost', 0) + new_cost
-                                
-                                save_token_usage()
-                            except AttributeError:
-                                logging.warning("Token usage information not available in response")
-
-                    if use_plain_responses:
-                        for content in response_contents:
-                            reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
-                            response_msg = await reply_to_msg.reply(content=content, suppress_embeds=True)
-                            response_msgs.append(response_msg)
-
-                            msg_nodes[response_msg.id] = MsgNode(next_msg=new_msg)
-                            await msg_nodes[response_msg.id].lock.acquire()
-
-                    break  # 如果成功就跳出循環
-                except Exception as e:
-                    retry_count += 1
-                    if retry_count >= max_retries:
-                        raise  # 如果重試次數用完就拋出異常
-                    await asyncio.sleep(1)  # 等待1秒後重試
-
-    except Exception:
-        logging.exception("Error while generating response")
-
-    for response_msg in response_msgs:
-        msg_nodes[response_msg.id].text = "".join(response_contents)
-        msg_nodes[response_msg.id].lock.release()
-
-    # Delete oldest MsgNodes (lowest message IDs) from the cache
-    if (num_nodes := len(msg_nodes)) > MAX_MESSAGE_NODES:
-        for msg_id in sorted(msg_nodes.keys())[: num_nodes - MAX_MESSAGE_NODES]:
-            async with msg_nodes.setdefault(msg_id, MsgNode()).lock:
-                msg_nodes.pop(msg_id, None)
+    return  # 直接返回，不执行后面的代码
 
 async def main():
     load_token_usage()
@@ -527,10 +335,6 @@ async def get_chat_history(channel, message, max_messages=10):
     """获取聊天历史"""
     history = []
     try:
-        # 用于跟踪连续消息
-        current_chain = []
-        last_author = None
-        
         # 获取频道历史消息
         async for msg in channel.history(limit=100, before=message):  # 增加搜索范围
             # 跳过非对话消息
@@ -539,7 +343,6 @@ async def get_chat_history(channel, message, max_messages=10):
                 
             # 构建消息
             content = None
-            current_author = msg.author
             
             # 处理机器人的回复
             if msg.author == discord_client.user:
@@ -557,35 +360,13 @@ async def get_chat_history(channel, message, max_messages=10):
                     continue
             
             if content and content.strip():  # 确保内容不为空
-                # 如果是同一个用户的连续消息
-                if current_author == last_author:
-                    current_chain.insert(0, content.strip())
-                else:
-                    # 如果有之前的消息链，先处理它
-                    if current_chain:
-                        combined_content = "\n".join(current_chain)
-                        history.append({
-                            "role": "assistant" if last_author == discord_client.user else "user",
-                            "content": combined_content
-                        })
-                        current_chain = []
-                    
-                    # 开始新的消息链
-                    current_chain = [content.strip()]
-                
-                last_author = current_author
+                history.append({
+                    "role": "assistant" if msg.author == discord_client.user else "user",
+                    "content": content.strip()
+                })
             
-            # 检查是否达到最大消息数
             if len(history) >= max_messages:
                 break
-                
-        # 处理最后一个消息链
-        if current_chain:
-            combined_content = "\n".join(current_chain)
-            history.append({
-                "role": "assistant" if last_author == discord_client.user else "user",
-                "content": combined_content
-            })
                 
     except Exception as e:
         logging.error(f"Error getting chat history: {e}")
