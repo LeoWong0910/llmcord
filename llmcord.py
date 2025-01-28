@@ -196,6 +196,11 @@ async def on_message(new_msg):
     # 处理 @ 消息
     if discord_client.user in new_msg.mentions:
         try:
+            # 获取聊天历史
+            cfg = get_config()
+            max_messages = cfg["max_messages"]
+            history = await get_chat_history(new_msg.channel, new_msg, max_messages - 1)
+            
             # 获取最近的连续消息
             messages = []
             current_author = new_msg.author
@@ -220,11 +225,11 @@ async def on_message(new_msg):
             # 合并连续消息
             combined_message = "\n".join(messages)
             
-            # 构建对话历史
-            history = [{
+            # 添加当前消息到历史记录
+            history.append({
                 "role": "user",
                 "content": combined_message
-            }]
+            })
             
             # 添加系统提示
             if system_prompt := cfg["system_prompt"]:
