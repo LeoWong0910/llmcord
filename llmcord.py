@@ -18,8 +18,27 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s",
 )
 
-VISION_MODEL_TAGS = ("gpt-4o", "claude-3", "gemini", "pixtral", "llava", "vision", "vl")
-PROVIDERS_SUPPORTING_USERNAMES = ("openai", "x-ai")
+VISION_MODEL_TAGS = (
+    "gpt-4o", 
+    "claude-3", 
+    "claude-3-opus",
+    "claude-3-sonnet", 
+    "claude-2", 
+    "deepseek-vision",
+    "deepseek-vl",
+    "gemini", 
+    "pixtral", 
+    "llava", 
+    "vision", 
+    "vl"
+)
+
+PROVIDERS_SUPPORTING_USERNAMES = (
+    "openai", 
+    "x-ai",
+    "claude",
+    "deepseek"
+)
 
 ALLOWED_FILE_TYPES = ("image", "text")
 
@@ -94,6 +113,14 @@ MODEL_PRICES = {
         'completion': 0.06
     },
     'claude/claude-2': {
+        'prompt': 0.02,
+        'completion': 0.04
+    },
+    'deepseek/deepseek-vision': {
+        'prompt': 0.02,
+        'completion': 0.04
+    },
+    'deepseek/deepseek-vl': {
         'prompt': 0.02,
         'completion': 0.04
     }
@@ -179,13 +206,17 @@ async def on_message(new_msg):
     channel_ids = tuple(id for id in (new_msg.channel.id, getattr(new_msg.channel, "parent_id", None), getattr(new_msg.channel, "category_id", None)) if id)
 
     cfg = get_config()
-
     allow_dms = cfg["allow_dms"]
-    permissions = cfg["permissions"]
-
-    (allowed_user_ids, blocked_user_ids), (allowed_role_ids, blocked_role_ids), (allowed_channel_ids, blocked_channel_ids) = (
-        (perm["allowed_ids"], perm["blocked_ids"]) for perm in (permissions["users"], permissions["roles"], permissions["channels"])
-    )
+    
+    # 檢查權限設置的格式
+    if isinstance(cfg["permissions"], dict):
+        permissions = cfg["permissions"]
+        (allowed_user_ids, blocked_user_ids), (allowed_role_ids, blocked_role_ids), (allowed_channel_ids, blocked_channel_ids) = (
+            (perm["allowed_ids"], perm["blocked_ids"]) for perm in (permissions["users"], permissions["roles"], permissions["channels"])
+        )
+    else:
+        # 如果是舊格式，使用默認權限（允許所有）
+        allowed_user_ids = blocked_user_ids = allowed_role_ids = blocked_role_ids = allowed_channel_ids = blocked_channel_ids = []
 
     allow_all_users = not allowed_user_ids if is_dm else not allowed_user_ids and not allowed_role_ids
     is_good_user = allow_all_users or new_msg.author.id in allowed_user_ids or any(id in allowed_role_ids for id in role_ids)
@@ -312,73 +343,85 @@ async def on_message(new_msg):
     kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_body=cfg["extra_api_parameters"])
     try:
         async with new_msg.channel.typing():
-            async for curr_chunk in await openai_client.chat.completions.create(**kwargs):
-                prev_content = prev_chunk.choices[0].delta.content if prev_chunk != None and prev_chunk.choices[0].delta.content else ""
-                curr_content = curr_chunk.choices[0].delta.content or ""
+            retry_count = 0
+            max_retries = 3
+            
+            while retry_count < max_retries:
+                try:
+                    async for curr_chunk in await openai_client.chat.completions.create(**kwargs):
+                        prev_content = prev_chunk.choices[0].delta.content if prev_chunk != None and prev_chunk.choices[0].delta.content else ""
+                        curr_content = curr_chunk.choices[0].delta.content or ""
 
-                prev_chunk = curr_chunk
+                        prev_chunk = curr_chunk
 
-                if not (response_contents or prev_content):
-                    continue
+                        if not (response_contents or prev_content):
+                            continue
 
-                if start_next_msg := response_contents == [] or len(response_contents[-1] + prev_content) > max_message_length:
-                    response_contents.append("")
+                        if start_next_msg := response_contents == [] or len(response_contents[-1] + prev_content) > max_message_length:
+                            response_contents.append("")
 
-                response_contents[-1] += prev_content
+                        response_contents[-1] += prev_content
 
-                if not use_plain_responses:
-                    finish_reason = curr_chunk.choices[0].finish_reason
+                        if not use_plain_responses:
+                            finish_reason = curr_chunk.choices[0].finish_reason
 
-                    ready_to_edit = (edit_task == None or edit_task.done()) and dt.now().timestamp() - last_task_time >= EDIT_DELAY_SECONDS
-                    msg_split_incoming = len(response_contents[-1] + curr_content) > max_message_length
-                    is_final_edit = finish_reason != None or msg_split_incoming
-                    is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
+                            ready_to_edit = (edit_task == None or edit_task.done()) and dt.now().timestamp() - last_task_time >= EDIT_DELAY_SECONDS
+                            msg_split_incoming = len(response_contents[-1] + curr_content) > max_message_length
+                            is_final_edit = finish_reason != None or msg_split_incoming
+                            is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
 
-                    if start_next_msg or ready_to_edit or is_final_edit:
-                        if edit_task != None:
-                            await edit_task
+                            if start_next_msg or ready_to_edit or is_final_edit:
+                                if edit_task != None:
+                                    await edit_task
 
-                        embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
-                        embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
+                                embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
+                                embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
 
-                        if start_next_msg:
+                                if start_next_msg:
+                                    reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
+                                    response_msg = await reply_to_msg.reply(embed=embed, silent=True)
+                                    response_msgs.append(response_msg)
+
+                                    msg_nodes[response_msg.id] = MsgNode(next_msg=new_msg)
+                                    await msg_nodes[response_msg.id].lock.acquire()
+                                else:
+                                    edit_task = asyncio.create_task(response_msgs[-1].edit(embed=embed))
+
+                                last_task_time = dt.now().timestamp()
+
+                        # Update token usage if available in the response
+                        if hasattr(curr_chunk, 'usage') and curr_chunk.usage:
+                            try:
+                                token_usage['total_tokens'] += getattr(curr_chunk.usage, 'total_tokens', 0)
+                                token_usage['completion_tokens'] += getattr(curr_chunk.usage, 'completion_tokens', 0)
+                                token_usage['prompt_tokens'] += getattr(curr_chunk.usage, 'prompt_tokens', 0)
+                                token_usage['conversations'] = token_usage.get('conversations', 0) + 1
+                                
+                                # 更新总成本
+                                if model in MODEL_PRICES:
+                                    new_cost = (getattr(curr_chunk.usage, 'completion_tokens', 0) / 1000 * MODEL_PRICES[model]['completion'] +
+                                               getattr(curr_chunk.usage, 'prompt_tokens', 0) / 1000 * MODEL_PRICES[model]['prompt'])
+                                    token_usage['total_cost'] = token_usage.get('total_cost', 0) + new_cost
+                                
+                                save_token_usage()
+                            except AttributeError:
+                                logging.warning("Token usage information not available in response")
+
+                    if use_plain_responses:
+                        for content in response_contents:
                             reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
-                            response_msg = await reply_to_msg.reply(embed=embed, silent=True)
+                            response_msg = await reply_to_msg.reply(content=content, suppress_embeds=True)
                             response_msgs.append(response_msg)
 
                             msg_nodes[response_msg.id] = MsgNode(next_msg=new_msg)
                             await msg_nodes[response_msg.id].lock.acquire()
-                        else:
-                            edit_task = asyncio.create_task(response_msgs[-1].edit(embed=embed))
 
-                        last_task_time = dt.now().timestamp()
-
-                # Update token usage if available in the response
-                if hasattr(curr_chunk, 'usage') and curr_chunk.usage:
-                    try:
-                        token_usage['total_tokens'] += getattr(curr_chunk.usage, 'total_tokens', 0)
-                        token_usage['completion_tokens'] += getattr(curr_chunk.usage, 'completion_tokens', 0)
-                        token_usage['prompt_tokens'] += getattr(curr_chunk.usage, 'prompt_tokens', 0)
-                        token_usage['conversations'] = token_usage.get('conversations', 0) + 1
-                        
-                        # 更新总成本
-                        if model in MODEL_PRICES:
-                            new_cost = (getattr(curr_chunk.usage, 'completion_tokens', 0) / 1000 * MODEL_PRICES[model]['completion'] +
-                                       getattr(curr_chunk.usage, 'prompt_tokens', 0) / 1000 * MODEL_PRICES[model]['prompt'])
-                            token_usage['total_cost'] = token_usage.get('total_cost', 0) + new_cost
-                        
-                        save_token_usage()
-                    except AttributeError:
-                        logging.warning("Token usage information not available in response")
-
-            if use_plain_responses:
-                for content in response_contents:
-                    reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
-                    response_msg = await reply_to_msg.reply(content=content, suppress_embeds=True)
-                    response_msgs.append(response_msg)
-
-                    msg_nodes[response_msg.id] = MsgNode(next_msg=new_msg)
-                    await msg_nodes[response_msg.id].lock.acquire()
+                    break  # 如果成功就跳出循環
+                except Exception as e:
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        raise  # 如果重試次數用完就拋出異常
+                    await asyncio.sleep(1)  # 等待1秒後重試
 
     except Exception:
         logging.exception("Error while generating response")
@@ -393,7 +436,6 @@ async def on_message(new_msg):
             async with msg_nodes.setdefault(msg_id, MsgNode()).lock:
                 msg_nodes.pop(msg_id, None)
 
-
 async def main():
     load_token_usage()
     await discord_client.start(cfg["bot_token"])
@@ -404,7 +446,9 @@ async def main():
 @app_commands.describe(message="輸入你想說的話")
 async def chat(interaction: discord.Interaction, message: str):
     """與AI助手對話"""
-    await process_message(interaction, message)
+    await interaction.response.defer()
+    response = await process_message(interaction, message)
+    await interaction.followup.send(response)
 
 @discord_client.tree.command(name="tokens", description="查看令牌使用統計")
 async def tokens(interaction: discord.Interaction):
@@ -435,7 +479,7 @@ async def reset(interaction: discord.Interaction):
 async def help(interaction: discord.Interaction):
     """顯示幫助信息"""
     help_text = """
-🤖 **AI助手指令列表**
+💡 **AI助手指令列表**
 
 📝 基礎對話
 • `/chat [消息]` - 與AI助手對話
@@ -503,64 +547,84 @@ async def config(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("❌ 只有管理員可以查看配置！", ephemeral=True)
 
-# 添加一个命令同步的斜杠命令（仅管理员可用）
-@discord_client.tree.command(name="sync", description="同步斜杠命令（仅管理员）")
+# 添加一个命令同步的斜杠命令（僅管理員可用）
+@discord_client.tree.command(name="sync", description="同步斜杠命令（僅管理員）")
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
 async def sync(interaction: discord.Interaction):
-    if interaction.user.guild_permissions.administrator:
+    """同步斜杠命令（僅管理員）"""
+    try:
         await discord_client.tree.sync()
-        await interaction.response.send_message("✅ 斜杠命令已同步！")
-    else:
-        await interaction.response.send_message("❌ 只有管理员可以同步命令！", ephemeral=True)
+        await interaction.response.send_message("✅ 斜杠命令已同步！", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ 權限不足，需要管理員權限！", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ 同步失敗：{str(e)}", ephemeral=True)
 
-# 添加处理消息的函数
-async def process_message(interaction: discord.Interaction, message: str):
-    """处理斜杠命令的对话消息"""
-    await interaction.response.defer()  # 先延迟响应，因为处理可能需要一些时间
-    
+# 修改處理消息的函數定義
+async def process_message(message_obj, content, images=None):
+    """處理消息和圖片"""
     cfg = get_config()
     provider, model = cfg["model"].split("/", 1)
     base_url = cfg["providers"][provider]["base_url"]
     api_key = cfg["providers"][provider].get("api_key", "sk-no-key-required")
     openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
 
-    # 构建消息
-    messages = [{"role": "user", "content": message}]
+    # 構建消息
+    messages = []
     
+    # 處理圖片
+    if images:
+        content_parts = []
+        for image in images:
+            if image.content_type and "image" in image.content_type:
+                image_data = await image.read()
+                image_base64 = b64encode(image_data).decode('utf-8')
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{image.content_type};base64,{image_base64}"
+                    }
+                })
+        
+        if content:
+            content_parts.append({
+                "type": "text",
+                "text": content
+            })
+        
+        messages.append({
+            "role": "user",
+            "content": content_parts
+        })
+    else:
+        messages.append({
+            "role": "user",
+            "content": content
+        })
+
     if system_prompt := cfg["system_prompt"]:
         messages.append({"role": "system", "content": system_prompt})
 
     # 生成回复
     try:
         response_content = ""
-        kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_body=cfg["extra_api_parameters"])
+        kwargs = dict(
+            model=model, 
+            messages=messages[::-1], 
+            stream=True,
+            max_tokens=cfg["extra_api_parameters"].get("max_tokens", 4096)
+        )
         
-        async for curr_chunk in await openai_client.chat.completions.create(**kwargs):
-            if curr_chunk.choices[0].delta.content:
-                response_content += curr_chunk.choices[0].delta.content
+        async for chunk in await openai_client.chat.completions.create(**kwargs):
+            if chunk.choices[0].delta.content:
+                response_content += chunk.choices[0].delta.content
                 
-                # 更新 token 使用统计
-                if hasattr(curr_chunk, 'usage') and curr_chunk.usage:
-                    try:
-                        token_usage['completion_tokens'] += getattr(curr_chunk.usage, 'completion_tokens', 0)
-                        token_usage['prompt_tokens'] += getattr(curr_chunk.usage, 'prompt_tokens', 0)
-                        token_usage['conversations'] = token_usage.get('conversations', 0) + 1
-                        
-                        # 更新成本
-                        if model in MODEL_PRICES:
-                            new_cost = (getattr(curr_chunk.usage, 'completion_tokens', 0) / 1000 * MODEL_PRICES[model]['completion'] +
-                                      getattr(curr_chunk.usage, 'prompt_tokens', 0) / 1000 * MODEL_PRICES[model]['prompt'])
-                            token_usage['total_cost'] = token_usage.get('total_cost', 0) + new_cost
-                        
-                        save_token_usage()
-                    except AttributeError:
-                        logging.warning("Token usage information not available in response")
-
-        # 发送完整回复
-        await interaction.followup.send(response_content)
-        
+        return response_content
+                
     except Exception as e:
-        logging.exception("Error while generating response")
-        await interaction.followup.send(f"❌ 生成回复时发生错误：{str(e)}", ephemeral=True)
+        logging.exception("Error processing message with image")
+        return f"❌ 處理圖片時發生錯誤：{str(e)}"
 
 async def show_usage_stats(interaction: discord.Interaction):
     """顯示使用統計信息"""

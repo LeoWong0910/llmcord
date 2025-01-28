@@ -51,8 +51,15 @@ providers:
     base_url: http://localhost:5000/v1
   jan:
     base_url: http://localhost:1337/v1
+  claude:
+    base_url: "https://api.anthropic.com/v1/"
+    api_key: "your-claude-api-key"
+  deepseek:
+    base_url: "https://api.deepseek.com/v1/"
+    api_key: "your-deepseek-api-key"
 
-model: openai/gpt-4o
+model: "claude/claude-3-5-sonnet-20241022"  # 或
+# model: "deepseek/deepseek-vision"
 
 extra_api_parameters:
   max_tokens: 4096
