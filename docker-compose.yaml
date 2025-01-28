@@ -1,7 +1,10 @@
 services:
-  container:
-    build: .
-    network_mode: host
+  discord-bot:
+    image: llmcord-discord-bot:latest
+    container_name: discord-bot
     restart: unless-stopped
     volumes:
-      - ./:/usr/src/app:ro
+      - ./config.yaml:/usr/src/app/config.yaml:ro
+      - ./data:/usr/src/app/data
+    environment:
+      - TZ=Asia/Macau

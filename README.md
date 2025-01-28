@@ -119,20 +119,76 @@ Or run a local model with:
 
 # Discord AI Assistant
 
-基於 [llmcord](https://github.com/jakobdylanc/llmcord) 的客製化 Discord AI 助手
+基於 [llmcord](https://github.com/jakobdylanc/llmcord) 的客製化 Discord AI 助手，支持圖片分析和多輪對話。
 
-## 主要更改
-- 添加了中文支持
-- 實現了斜杠命令系統
-- 添加了代幣使用統計
-- 添加了成本追蹤功能
-- 支持 USD/RMB 餘額顯示
+## 快速開始
 
-## 新增指令
-- `/chat` - 與 AI 助手對話
+1. 配置設置：
+```bash
+# 複製示例配置文件
+cp config-example.yaml config.yaml
+
+# 編輯配置文件，填入你的設置
+nano config.yaml
+```
+
+2. 使用 Docker 部署：
+```bash
+# 構建並啟動
+docker compose up -d
+
+# 查看日誌
+docker compose logs -f
+```
+
+3. 停止服務：
+```bash
+docker compose down
+```
+
+## 主要功能
+
+- 支持多種 LLM 模型
+- 支持圖片分析
+- 支持中英文對話
+- 支持多輪對話
+- 支持文本文件處理
+- 支持代幣使用統計
+- 支持成本追蹤
+
+## 常用命令
+
+基礎命令：
+- `/chat [消息]` - 與AI助手對話
+- `/help` - 顯示幫助信息
 - `/tokens` - 查看令牌使用統計
 - `/cost` - 查看成本統計
-- `/daily` - 查看每日使用統計
-- `/help` - 顯示所有可用命令
-- `/reset` - 重置統計數據（僅管理員）
-- `/config` - 查看當前配置（僅管理員）
+- `/daily` - 查看每日統計
+- `/info` - 查看機器人信息
+
+管理命令（需要管理員權限）：
+- `/sync` - 同步斜杠命令
+- `/reset` - 重置統計數據
+- `/config` - 查看當前配置
+
+## 注意事項
+
+1. 請確保 config.yaml 中的 token 和 API key 已正確設置
+2. 數據文件保存在 data 目錄中
+3. 日誌可通過 docker compose logs 查看
+4. 支持熱重載配置（無需重啟即可更改設置）
+5. 自動分割過長消息
+6. 支持流式輸出
+
+## 環境要求
+
+- Docker
+- Docker Compose
+
+## 技術支持
+
+如有問題，請提交 Issue 或加入我們的 Discord 社群。
+
+## 授權協議
+
+本項目基於 MIT 協議開源。
