@@ -1,10 +1,11 @@
 services:
   discord-bot:
-    image: llmcord-discord-bot:latest
+    image: llmcord-discord-bot:latest-amd64
     container_name: discord-bot
     restart: unless-stopped
     volumes:
       - ./config.yaml:/usr/src/app/config.yaml:ro
       - ./data:/usr/src/app/data
+      - ./token_usage.json:/usr/src/app/token_usage.json
     environment:
       - TZ=Asia/Macau

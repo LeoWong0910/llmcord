@@ -163,58 +163,63 @@ class MsgNode:
 
 @discord_client.event
 async def on_message(new_msg):
-    global msg_nodes, last_task_time
-
-    # 首先检查是否是机器人消息
     if new_msg.author.bot:
         return
 
-    # 处理命令 - 检查原始消息和清理后的消息
-    cleaned_content = new_msg.content.replace(f'<@{discord_client.user.id}>', '').strip()
-    if cleaned_content in ['!tokens', '!usage', '!cost']:
-        total = token_usage['completion_tokens'] + token_usage['prompt_tokens']
-        
-        # 计算成本
-        cfg = get_config()
-        model = cfg["model"]
-        cost = 0
-        if model in MODEL_PRICES:
-            prompt_cost = (token_usage['prompt_tokens'] / 1000) * MODEL_PRICES[model]['prompt']
-            completion_cost = (token_usage['completion_tokens'] / 1000) * MODEL_PRICES[model]['completion']
-            cost = prompt_cost + completion_cost
-
-        # 获取余额信息
-        billing = cfg.get('billing', {})
-        initial_usd = billing.get('initial_balance_usd', 100.00)
-        exchange_rate = billing.get('exchange_rate', 7.20)
-        
-        # 计算剩余金额
-        remaining_usd = initial_usd - token_usage.get('total_cost', 0) - cost
-        remaining_rmb = remaining_usd * exchange_rate
-
-        usage_str = f"""
-📊 **令牌使用統計** (開始時間: {token_usage['last_reset']})
-
-💬 對話令牌數據：
-• 總計令牌：{total:,} 個
-• 回覆令牌：{token_usage['completion_tokens']:,} 個
-• 提示令牌：{token_usage['prompt_tokens']:,} 個
-
-💰 預估成本：
-• 提示成本：${prompt_cost:.4f}
-• 回覆成本：${completion_cost:.4f}
-• 總計成本：${cost:.4f}
-
-💳 賬戶餘額：
-• 剩餘金額(USD)：${remaining_usd:.2f}
-• 剩餘金額(RMB)：¥{remaining_rmb:.2f}
-
-📈 平均數據：
-• 每次對話平均令牌：{total / max(1, token_usage.get('conversations', 1)):,.0f} 個
-• 每千令牌成本：${(cost * 1000 / max(1, total)):.4f}
-"""
-        await new_msg.channel.send(usage_str)
-        return
+    # 处理 @ 消息
+    if discord_client.user in new_msg.mentions:
+        try:
+            # 获取聊天历史
+            cfg = get_config()
+            max_messages = cfg["max_messages"]
+            history = await get_chat_history(new_msg.channel, new_msg, max_messages - 1)
+            
+            # 添加当前消息
+            content = new_msg.content.replace(discord_client.user.mention, '').strip()
+            history.append({
+                "role": "user",
+                "content": content
+            })
+            
+            # 添加系统提示
+            if system_prompt := cfg["system_prompt"]:
+                history.append({
+                    "role": "system",
+                    "content": system_prompt
+                })
+            
+            # 调用 API
+            provider, model = cfg["model"].split("/", 1)
+            base_url = cfg["providers"][provider]["base_url"]
+            api_key = cfg["providers"][provider].get("api_key", "sk-no-key-required")
+            openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+            
+            async with new_msg.channel.typing():
+                response_content = ""
+                async for chunk in await openai_client.chat.completions.create(
+                    model=model,
+                    messages=history,
+                    stream=True,
+                    **cfg["extra_api_parameters"]
+                ):
+                    if chunk.choices[0].delta.content:
+                        response_content += chunk.choices[0].delta.content
+                        
+                        # 更新 token 使用统计
+                        if hasattr(chunk, 'usage') and chunk.usage:
+                            update_token_usage(chunk.usage, model)
+                
+                # 分块发送响应
+                if len(response_content) > 2000:
+                    chunks = [response_content[i:i+1900] for i in range(0, len(response_content), 1900)]
+                    for chunk in chunks:
+                        await new_msg.reply(chunk)
+                else:
+                    await new_msg.reply(response_content)
+                    
+        except Exception as e:
+            logging.exception("Error processing message")
+            await new_msg.reply(f"❌ 发生错误：{str(e)}")
 
     # 检查是否需要处理常规消息
     is_dm = new_msg.channel.type == discord.ChannelType.private
@@ -466,29 +471,216 @@ async def chat(interaction: discord.Interaction, message: str):
     """与AI助手对话"""
     try:
         await interaction.response.defer()
-        response = await process_message(interaction, message)
-        # 确保响应不超过Discord的限制
-        if len(response) > 2000:
-            # 分块发送
-            chunks = [response[i:i+1900] for i in range(0, len(response), 1900)]
+        
+        # 获取聊天历史
+        cfg = get_config()
+        max_messages = cfg["max_messages"]
+        history = await get_chat_history(interaction.channel, interaction.message, max_messages - 1)
+        
+        # 添加当前消息
+        history.append({
+            "role": "user",
+            "content": message
+        })
+        
+        # 添加系统提示
+        if system_prompt := cfg["system_prompt"]:
+            history.append({
+                "role": "system",
+                "content": system_prompt
+            })
+        
+        # 调用 API
+        provider, model = cfg["model"].split("/", 1)
+        base_url = cfg["providers"][provider]["base_url"]
+        api_key = cfg["providers"][provider].get("api_key", "sk-no-key-required")
+        openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+        
+        response_content = ""
+        async for chunk in await openai_client.chat.completions.create(
+            model=model,
+            messages=history,
+            stream=True,
+            **cfg["extra_api_parameters"]
+        ):
+            if chunk.choices[0].delta.content:
+                response_content += chunk.choices[0].delta.content
+                
+                # 更新 token 使用统计
+                if hasattr(chunk, 'usage') and chunk.usage:
+                    update_token_usage(chunk.usage, model)
+        
+        # 分块发送响应
+        if len(response_content) > 2000:
+            chunks = [response_content[i:i+1900] for i in range(0, len(response_content), 1900)]
             await interaction.followup.send(chunks[0])
             for chunk in chunks[1:]:
                 await interaction.channel.send(chunk)
         else:
-            await interaction.followup.send(response)
+            await interaction.followup.send(response_content)
+            
     except Exception as e:
         logging.exception("Error in chat command")
         await interaction.followup.send(f"❌ 发生错误：{str(e)}", ephemeral=True)
+
+async def get_chat_history(channel, message, max_messages=10):
+    """获取聊天历史"""
+    history = []
+    try:
+        # 用于跟踪连续消息
+        current_chain = []
+        last_author = None
+        
+        # 获取频道历史消息
+        async for msg in channel.history(limit=100, before=message):  # 增加搜索范围
+            # 跳过非对话消息
+            if msg.author.bot and msg.author != discord_client.user:
+                continue
+                
+            # 构建消息
+            content = None
+            current_author = msg.author
+            
+            # 处理机器人的回复
+            if msg.author == discord_client.user:
+                content = msg.content
+            
+            # 处理 @ 消息
+            elif discord_client.user in msg.mentions:
+                content = msg.content.replace(discord_client.user.mention, '').strip()
+            
+            # 处理 /chat 命令消息
+            elif msg.interaction and msg.interaction.name == "chat":
+                try:
+                    content = next((opt.value for opt in msg.interaction.command.options if opt.name == "message"), None)
+                except:
+                    continue
+            
+            if content and content.strip():  # 确保内容不为空
+                # 如果是同一个用户的连续消息
+                if current_author == last_author:
+                    current_chain.insert(0, content.strip())
+                else:
+                    # 如果有之前的消息链，先处理它
+                    if current_chain:
+                        combined_content = "\n".join(current_chain)
+                        history.append({
+                            "role": "assistant" if last_author == discord_client.user else "user",
+                            "content": combined_content
+                        })
+                        current_chain = []
+                    
+                    # 开始新的消息链
+                    current_chain = [content.strip()]
+                
+                last_author = current_author
+            
+            # 检查是否达到最大消息数
+            if len(history) >= max_messages:
+                break
+                
+        # 处理最后一个消息链
+        if current_chain:
+            combined_content = "\n".join(current_chain)
+            history.append({
+                "role": "assistant" if last_author == discord_client.user else "user",
+                "content": combined_content
+            })
+                
+    except Exception as e:
+        logging.error(f"Error getting chat history: {e}")
+        
+    return list(reversed(history))  # 保持时间顺序
+
+def update_token_usage(usage, model):
+    """更新令牌使用统计"""
+    try:
+        token_usage['total_tokens'] += getattr(usage, 'total_tokens', 0)
+        token_usage['completion_tokens'] += getattr(usage, 'completion_tokens', 0)
+        token_usage['prompt_tokens'] += getattr(usage, 'prompt_tokens', 0)
+        token_usage['conversations'] = token_usage.get('conversations', 0) + 1
+        
+        # 更新每日统计
+        today = datetime.now().strftime('%Y-%m-%d')
+        if 'daily' not in token_usage:
+            token_usage['daily'] = {}
+        token_usage['daily'][today] = token_usage['daily'].get(today, 0) + getattr(usage, 'total_tokens', 0)
+        
+        # 更新成本
+        if model in MODEL_PRICES:
+            new_cost = (getattr(usage, 'completion_tokens', 0) / 1000 * MODEL_PRICES[model]['completion'] +
+                       getattr(usage, 'prompt_tokens', 0) / 1000 * MODEL_PRICES[model]['prompt'])
+            token_usage['total_cost'] = token_usage.get('total_cost', 0) + new_cost
+            token_usage['daily'][f"{today}_cost"] = token_usage['daily'].get(f"{today}_cost", 0) + new_cost
+        
+        save_token_usage()
+    except Exception as e:
+        logging.error(f"Error updating token usage: {e}")
 
 @discord_client.tree.command(name="tokens", description="查看令牌使用統計")
 async def tokens(interaction: discord.Interaction):
     """顯示令牌使用統計"""
     await show_usage_stats(interaction)
 
-@discord_client.tree.command(name="cost", description="查看成本統計")
-async def cost(interaction: discord.Interaction):
-    """顯示成本統計"""
-    await show_usage_stats(interaction)
+@discord_client.tree.command(name="stats", description="查看詳細的使用統計")
+async def stats(interaction: discord.Interaction):
+    """顯示詳細的使用統計信息"""
+    total = token_usage['completion_tokens'] + token_usage['prompt_tokens']
+    
+    # 计算成本
+    cfg = get_config()
+    model = cfg["model"]
+    cost = 0
+    if model in MODEL_PRICES:
+        prompt_cost = (token_usage['prompt_tokens'] / 1000) * MODEL_PRICES[model]['prompt']
+        completion_cost = (token_usage['completion_tokens'] / 1000) * MODEL_PRICES[model]['completion']
+        cost = prompt_cost + completion_cost
+
+    # 获取账户余额信息
+    billing = cfg.get('billing', {})
+    initial_usd = billing.get('initial_balance_usd', 100.00)
+    exchange_rate = billing.get('exchange_rate', 7.20)
+    
+    # 计算剩余金额
+    remaining_usd = initial_usd - token_usage.get('total_cost', 0) - cost
+    remaining_rmb = remaining_usd * exchange_rate
+
+    # 计算每日统计
+    today = datetime.now().strftime('%Y-%m-%d')
+    if 'daily' not in token_usage:
+        token_usage['daily'] = {}
+    
+    daily_tokens = token_usage['daily'].get(today, 0)
+    daily_cost = token_usage['daily'].get(f"{today}_cost", 0)
+
+    stats_str = f"""
+📊 **使用統計報告** 
+開始時間: {token_usage['last_reset']}
+
+💬 **總體令牌使用**
+• 總計令牌：{total:,} 個
+• 提示令牌：{token_usage['prompt_tokens']:,} 個
+• 回覆令牌：{token_usage['completion_tokens']:,} 個
+• 對話次數：{token_usage.get('conversations', 0):,} 次
+
+💰 **成本分析**
+• 提示成本：${prompt_cost:.4f}
+• 回覆成本：${completion_cost:.4f}
+• 總計成本：${cost:.4f}
+
+📅 **今日統計**
+• 今日令牌：{daily_tokens:,} 個
+• 今日成本：${daily_cost:.4f}
+
+💳 **賬戶餘額**
+• 剩餘(USD)：${remaining_usd:.2f}
+• 剩餘(RMB)：¥{remaining_rmb:.2f}
+
+📈 **效率指標**
+• 平均令牌/對話：{total / max(1, token_usage.get('conversations', 1)):,.0f} 個
+• 平均成本/千令牌：${(cost * 1000 / max(1, total)):.4f}
+"""
+    await interaction.response.send_message(stats_str)
 
 @discord_client.tree.command(name="reset", description="重置統計數據（僅管理員）")
 async def reset(interaction: discord.Interaction):
@@ -688,10 +880,10 @@ async def process_message(message_obj, content, images=None):
         return f"❌ 處理圖片時發生錯誤：{str(e)}"
 
 async def show_usage_stats(interaction: discord.Interaction):
-    """顯示使用統計信息"""
+    """顯示基本使用統計信息"""
     total = token_usage['completion_tokens'] + token_usage['prompt_tokens']
     
-    # 计算成本和余额
+    # 计算成本
     cfg = get_config()
     model = cfg["model"]
     cost = 0
@@ -700,33 +892,34 @@ async def show_usage_stats(interaction: discord.Interaction):
         completion_cost = (token_usage['completion_tokens'] / 1000) * MODEL_PRICES[model]['completion']
         cost = prompt_cost + completion_cost
 
+    # 获取账户余额
     billing = cfg.get('billing', {})
-    initial_usd = billing.get('initial_balance_usd', 5.00)
+    initial_usd = billing.get('initial_balance_usd', 100.00)
     exchange_rate = billing.get('exchange_rate', 7.20)
     
     remaining_usd = initial_usd - token_usage.get('total_cost', 0) - cost
     remaining_rmb = remaining_usd * exchange_rate
 
+    # 获取今日使用量
+    today = datetime.now().strftime('%Y-%m-%d')
+    if 'daily' not in token_usage:
+        token_usage['daily'] = {}
+    
+    daily_tokens = token_usage['daily'].get(today, 0)
+
     usage_str = f"""
-📊 **令牌使用統計** (開始時間: {token_usage['last_reset']})
+📊 **令牌使用概覽**
 
-💬 對話令牌數據：
-• 總計令牌：{total:,} 個
-• 回覆令牌：{token_usage['completion_tokens']:,} 個
-• 提示令牌：{token_usage['prompt_tokens']:,} 個
+💬 **總計使用**
+• 總令牌：{total:,} 個
+• 總成本：${cost:.4f}
 
-💰 預估成本：
-• 提示成本：${prompt_cost:.4f}
-• 回覆成本：${completion_cost:.4f}
-• 總計成本：${cost:.4f}
+📅 **今日使用**
+• 今日令牌：{daily_tokens:,} 個
 
-💳 賬戶餘額：
-• 剩餘金額(USD)：${remaining_usd:.2f}
-• 剩餘金額(RMB)：¥{remaining_rmb:.2f}
-
-📈 平均數據：
-• 每次對話平均令牌：{total / max(1, token_usage.get('conversations', 1)):,.0f} 個
-• 每千令牌成本：${(cost * 1000 / max(1, total)):.4f}
+💳 **餘額**
+• USD：${remaining_usd:.2f}
+• RMB：¥{remaining_rmb:.2f}
 """
     await interaction.response.send_message(usage_str)
 
