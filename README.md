@@ -116,3 +116,23 @@ Or run a local model with:
     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=jakobdylanc/llmcord&type=Date" />
   </picture>
 </a>
+
+# Discord AI Assistant
+
+基於 [llmcord](https://github.com/jakobdylanc/llmcord) 的客製化 Discord AI 助手
+
+## 主要更改
+- 添加了中文支持
+- 實現了斜杠命令系統
+- 添加了代幣使用統計
+- 添加了成本追蹤功能
+- 支持 USD/RMB 餘額顯示
+
+## 新增指令
+- `/chat` - 與 AI 助手對話
+- `/tokens` - 查看令牌使用統計
+- `/cost` - 查看成本統計
+- `/daily` - 查看每日使用統計
+- `/help` - 顯示所有可用命令
+- `/reset` - 重置統計數據（僅管理員）
+- `/config` - 查看當前配置（僅管理員）

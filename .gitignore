@@ -11,3 +11,17 @@
 !config-example.yaml
 !docker-compose.yaml
 !requirements.txt
+
+# 配置文件
+config.yaml
+token_usage.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+
+# IDE
+.vscode/
+.idea/

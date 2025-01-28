@@ -4,11 +4,14 @@ from dataclasses import dataclass, field
 from datetime import datetime as dt
 import logging
 from typing import Literal, Optional
+import json
+from datetime import datetime, timedelta
 
 import discord
 import httpx
 from openai import AsyncOpenAI
 import yaml
+from discord import app_commands
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +31,30 @@ EDIT_DELAY_SECONDS = 1
 
 MAX_MESSAGE_NODES = 100
 
+# Add a global variable to track token usage
+token_usage = {
+    'total_tokens': 0,
+    'completion_tokens': 0,
+    'prompt_tokens': 0,
+    'last_reset': datetime.now().isoformat(),
+    'initial_balance_usd': 100.00,
+    'initial_balance_rmb': 720.00,
+    'total_cost': 0.00
+}
+
+# Add function to save/load token usage
+def save_token_usage():
+    with open('token_usage.json', 'w') as f:
+        json.dump(token_usage, f)
+
+def load_token_usage():
+    try:
+        with open('token_usage.json', 'r') as f:
+            global token_usage
+            token_usage = json.load(f)
+    except FileNotFoundError:
+        save_token_usage()
+
 
 def get_config(filename="config.yaml"):
     with open(filename, "r") as file:
@@ -42,13 +69,35 @@ if client_id := cfg["client_id"]:
 intents = discord.Intents.default()
 intents.message_content = True
 activity = discord.CustomActivity(name=(cfg["status_message"] or "github.com/jakobdylanc/llmcord")[:128])
-discord_client = discord.Client(intents=intents, activity=activity)
+
+class LLMClient(discord.Client):
+    def __init__(self):
+        super().__init__(intents=intents, activity=activity)
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        # 同步全局命令
+        await self.tree.sync()
+        logging.info("Slash commands synced!")
+
+discord_client = LLMClient()
 
 httpx_client = httpx.AsyncClient()
 
 msg_nodes = {}
 last_task_time = 0
 
+# 添加模型价格信息（每1000个tokens的价格，单位：美元）
+MODEL_PRICES = {
+    'claude/claude-3-5-sonnet-20241022': {
+        'prompt': 0.03,
+        'completion': 0.06
+    },
+    'claude/claude-2': {
+        'prompt': 0.02,
+        'completion': 0.04
+    }
+}
 
 @dataclass
 class MsgNode:
@@ -70,9 +119,60 @@ class MsgNode:
 async def on_message(new_msg):
     global msg_nodes, last_task_time
 
-    is_dm = new_msg.channel.type == discord.ChannelType.private
+    # 首先检查是否是机器人消息
+    if new_msg.author.bot:
+        return
 
-    if (not is_dm and discord_client.user not in new_msg.mentions) or new_msg.author.bot:
+    # 处理命令 - 检查原始消息和清理后的消息
+    cleaned_content = new_msg.content.replace(f'<@{discord_client.user.id}>', '').strip()
+    if cleaned_content in ['!tokens', '!usage', '!cost']:
+        total = token_usage['completion_tokens'] + token_usage['prompt_tokens']
+        
+        # 计算成本
+        cfg = get_config()
+        model = cfg["model"]
+        cost = 0
+        if model in MODEL_PRICES:
+            prompt_cost = (token_usage['prompt_tokens'] / 1000) * MODEL_PRICES[model]['prompt']
+            completion_cost = (token_usage['completion_tokens'] / 1000) * MODEL_PRICES[model]['completion']
+            cost = prompt_cost + completion_cost
+
+        # 获取余额信息
+        billing = cfg.get('billing', {})
+        initial_usd = billing.get('initial_balance_usd', 100.00)
+        exchange_rate = billing.get('exchange_rate', 7.20)
+        
+        # 计算剩余金额
+        remaining_usd = initial_usd - token_usage.get('total_cost', 0) - cost
+        remaining_rmb = remaining_usd * exchange_rate
+
+        usage_str = f"""
+📊 **令牌使用統計** (開始時間: {token_usage['last_reset']})
+
+💬 對話令牌數據：
+• 總計令牌：{total:,} 個
+• 回覆令牌：{token_usage['completion_tokens']:,} 個
+• 提示令牌：{token_usage['prompt_tokens']:,} 個
+
+💰 預估成本：
+• 提示成本：${prompt_cost:.4f}
+• 回覆成本：${completion_cost:.4f}
+• 總計成本：${cost:.4f}
+
+💳 賬戶餘額：
+• 剩餘金額(USD)：${remaining_usd:.2f}
+• 剩餘金額(RMB)：¥{remaining_rmb:.2f}
+
+📈 平均數據：
+• 每次對話平均令牌：{total / max(1, token_usage.get('conversations', 1)):,.0f} 個
+• 每千令牌成本：${(cost * 1000 / max(1, total)):.4f}
+"""
+        await new_msg.channel.send(usage_str)
+        return
+
+    # 检查是否需要处理常规消息
+    is_dm = new_msg.channel.type == discord.ChannelType.private
+    if not is_dm and discord_client.user not in new_msg.mentions:
         return
 
     role_ids = tuple(role.id for role in getattr(new_msg.author, "roles", ()))
@@ -253,6 +353,24 @@ async def on_message(new_msg):
 
                         last_task_time = dt.now().timestamp()
 
+                # Update token usage if available in the response
+                if hasattr(curr_chunk, 'usage') and curr_chunk.usage:
+                    try:
+                        token_usage['total_tokens'] += getattr(curr_chunk.usage, 'total_tokens', 0)
+                        token_usage['completion_tokens'] += getattr(curr_chunk.usage, 'completion_tokens', 0)
+                        token_usage['prompt_tokens'] += getattr(curr_chunk.usage, 'prompt_tokens', 0)
+                        token_usage['conversations'] = token_usage.get('conversations', 0) + 1
+                        
+                        # 更新总成本
+                        if model in MODEL_PRICES:
+                            new_cost = (getattr(curr_chunk.usage, 'completion_tokens', 0) / 1000 * MODEL_PRICES[model]['completion'] +
+                                       getattr(curr_chunk.usage, 'prompt_tokens', 0) / 1000 * MODEL_PRICES[model]['prompt'])
+                            token_usage['total_cost'] = token_usage.get('total_cost', 0) + new_cost
+                        
+                        save_token_usage()
+                    except AttributeError:
+                        logging.warning("Token usage information not available in response")
+
             if use_plain_responses:
                 for content in response_contents:
                     reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
@@ -277,7 +395,214 @@ async def on_message(new_msg):
 
 
 async def main():
+    load_token_usage()
     await discord_client.start(cfg["bot_token"])
 
+
+# 修改和添加斜杠命令
+@discord_client.tree.command(name="chat", description="與AI助手對話")
+@app_commands.describe(message="輸入你想說的話")
+async def chat(interaction: discord.Interaction, message: str):
+    """與AI助手對話"""
+    await process_message(interaction, message)
+
+@discord_client.tree.command(name="tokens", description="查看令牌使用統計")
+async def tokens(interaction: discord.Interaction):
+    """顯示令牌使用統計"""
+    await show_usage_stats(interaction)
+
+@discord_client.tree.command(name="cost", description="查看成本統計")
+async def cost(interaction: discord.Interaction):
+    """顯示成本統計"""
+    await show_usage_stats(interaction)
+
+@discord_client.tree.command(name="reset", description="重置統計數據（僅管理員）")
+async def reset(interaction: discord.Interaction):
+    """重置統計數據"""
+    if interaction.user.guild_permissions.administrator:
+        token_usage['total_tokens'] = 0
+        token_usage['completion_tokens'] = 0
+        token_usage['prompt_tokens'] = 0
+        token_usage['conversations'] = 0
+        token_usage['total_cost'] = 0
+        token_usage['last_reset'] = datetime.now().isoformat()
+        save_token_usage()
+        await interaction.response.send_message("✅ 統計數據已重置！")
+    else:
+        await interaction.response.send_message("❌ 只有管理員可以重置統計數據！", ephemeral=True)
+
+@discord_client.tree.command(name="help", description="顯示所有可用命令")
+async def help(interaction: discord.Interaction):
+    """顯示幫助信息"""
+    help_text = """
+🤖 **AI助手指令列表**
+
+📝 基礎對話
+• `/chat [消息]` - 與AI助手對話
+• `@AI助手 [消息]` - 另一種對話方式
+
+📊 統計信息
+• `/tokens` - 查看令牌使用統計
+• `/cost` - 查看成本統計
+• `/daily` - 查看每日使用統計
+
+💡 管理功能
+• `/reset` - 重置統計數據（僅管理員）
+• `/sync` - 同步斜杠命令（僅管理員）
+• `/config` - 查看當前配置（僅管理員）
+
+🔍 使用提示：
+1. 可以發送圖片（支持視覺模型）
+2. 可以發送文本文件
+3. 可以在線程中使用
+4. 支持多輪對話
+5. 支持中英文切換
+
+💰 計費說明：
+• 每1K令牌成本：
+  - 提示：$0.03
+  - 回覆：$0.06
+• 支持餘額查詢
+• 支持成本統計
+"""
+    await interaction.response.send_message(help_text)
+
+@discord_client.tree.command(name="daily", description="查看每日使用統計")
+async def daily(interaction: discord.Interaction):
+    """顯示每日使用統計"""
+    if 'daily' not in token_usage:
+        token_usage['daily'] = {}
+    
+    today = datetime.now().strftime('%Y-%m-%d')
+    daily_stats = f"""
+📅 **每日使用統計**
+• 今日使用：{token_usage['daily'].get(today, 0):,} tokens
+• 今日成本：${token_usage['daily'].get(f"{today}_cost", 0):.4f}
+
+📊 **過去7天統計**
+• 平均使用：{sum(token_usage['daily'].values()) / max(1, len(token_usage['daily'])):,.0f} tokens/天
+• 平均成本：${sum(v for k, v in token_usage['daily'].items() if k.endswith('_cost')) / max(1, len([k for k in token_usage['daily'].keys() if k.endswith('_cost')])):,.4f}/天
+"""
+    await interaction.response.send_message(daily_stats)
+
+@discord_client.tree.command(name="config", description="查看當前配置（僅管理員）")
+async def config(interaction: discord.Interaction):
+    """顯示當前配置"""
+    if interaction.user.guild_permissions.administrator:
+        cfg = get_config()
+        config_text = f"""
+⚙️ **當前配置**
+• 模型：{cfg['model']}
+• 最大文本：{cfg['max_text']:,} 字符
+• 最大圖片：{cfg['max_images']} 張
+• 最大消息：{cfg['max_messages']} 條
+• 初始餘額：${cfg['billing']['initial_balance_usd']:.2f}
+• 匯率：{cfg['billing']['exchange_rate']}
+"""
+        await interaction.response.send_message(config_text)
+    else:
+        await interaction.response.send_message("❌ 只有管理員可以查看配置！", ephemeral=True)
+
+# 添加一个命令同步的斜杠命令（仅管理员可用）
+@discord_client.tree.command(name="sync", description="同步斜杠命令（仅管理员）")
+async def sync(interaction: discord.Interaction):
+    if interaction.user.guild_permissions.administrator:
+        await discord_client.tree.sync()
+        await interaction.response.send_message("✅ 斜杠命令已同步！")
+    else:
+        await interaction.response.send_message("❌ 只有管理员可以同步命令！", ephemeral=True)
+
+# 添加处理消息的函数
+async def process_message(interaction: discord.Interaction, message: str):
+    """处理斜杠命令的对话消息"""
+    await interaction.response.defer()  # 先延迟响应，因为处理可能需要一些时间
+    
+    cfg = get_config()
+    provider, model = cfg["model"].split("/", 1)
+    base_url = cfg["providers"][provider]["base_url"]
+    api_key = cfg["providers"][provider].get("api_key", "sk-no-key-required")
+    openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+
+    # 构建消息
+    messages = [{"role": "user", "content": message}]
+    
+    if system_prompt := cfg["system_prompt"]:
+        messages.append({"role": "system", "content": system_prompt})
+
+    # 生成回复
+    try:
+        response_content = ""
+        kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_body=cfg["extra_api_parameters"])
+        
+        async for curr_chunk in await openai_client.chat.completions.create(**kwargs):
+            if curr_chunk.choices[0].delta.content:
+                response_content += curr_chunk.choices[0].delta.content
+                
+                # 更新 token 使用统计
+                if hasattr(curr_chunk, 'usage') and curr_chunk.usage:
+                    try:
+                        token_usage['completion_tokens'] += getattr(curr_chunk.usage, 'completion_tokens', 0)
+                        token_usage['prompt_tokens'] += getattr(curr_chunk.usage, 'prompt_tokens', 0)
+                        token_usage['conversations'] = token_usage.get('conversations', 0) + 1
+                        
+                        # 更新成本
+                        if model in MODEL_PRICES:
+                            new_cost = (getattr(curr_chunk.usage, 'completion_tokens', 0) / 1000 * MODEL_PRICES[model]['completion'] +
+                                      getattr(curr_chunk.usage, 'prompt_tokens', 0) / 1000 * MODEL_PRICES[model]['prompt'])
+                            token_usage['total_cost'] = token_usage.get('total_cost', 0) + new_cost
+                        
+                        save_token_usage()
+                    except AttributeError:
+                        logging.warning("Token usage information not available in response")
+
+        # 发送完整回复
+        await interaction.followup.send(response_content)
+        
+    except Exception as e:
+        logging.exception("Error while generating response")
+        await interaction.followup.send(f"❌ 生成回复时发生错误：{str(e)}", ephemeral=True)
+
+async def show_usage_stats(interaction: discord.Interaction):
+    """顯示使用統計信息"""
+    total = token_usage['completion_tokens'] + token_usage['prompt_tokens']
+    
+    # 计算成本和余额
+    cfg = get_config()
+    model = cfg["model"]
+    cost = 0
+    if model in MODEL_PRICES:
+        prompt_cost = (token_usage['prompt_tokens'] / 1000) * MODEL_PRICES[model]['prompt']
+        completion_cost = (token_usage['completion_tokens'] / 1000) * MODEL_PRICES[model]['completion']
+        cost = prompt_cost + completion_cost
+
+    billing = cfg.get('billing', {})
+    initial_usd = billing.get('initial_balance_usd', 5.00)
+    exchange_rate = billing.get('exchange_rate', 7.20)
+    
+    remaining_usd = initial_usd - token_usage.get('total_cost', 0) - cost
+    remaining_rmb = remaining_usd * exchange_rate
+
+    usage_str = f"""
+📊 **令牌使用統計** (開始時間: {token_usage['last_reset']})
+
+💬 對話令牌數據：
+• 總計令牌：{total:,} 個
+• 回覆令牌：{token_usage['completion_tokens']:,} 個
+• 提示令牌：{token_usage['prompt_tokens']:,} 個
+
+💰 預估成本：
+• 提示成本：${prompt_cost:.4f}
+• 回覆成本：${completion_cost:.4f}
+• 總計成本：${cost:.4f}
+
+💳 賬戶餘額：
+• 剩餘金額(USD)：${remaining_usd:.2f}
+• 剩餘金額(RMB)：¥{remaining_rmb:.2f}
+
+📈 平均數據：
+• 每次對話平均令牌：{total / max(1, token_usage.get('conversations', 1)):,.0f} 個
+• 每千令牌成本：${(cost * 1000 / max(1, total)):.4f}
+"""
+    await interaction.response.send_message(usage_str)
 
 asyncio.run(main())
